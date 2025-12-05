@@ -4,26 +4,37 @@ Orchestrates database operations and calculations.
 Following CryptoLens Data Architecture Specification.
 Portfolio valuation uses CoinGecko prices as canonical source.
 """
-from typing import List, Dict
-from decimal import Decimal
-from datetime import datetime
-from uuid import UUID
-from sqlalchemy.orm import Session
+# Standard library imports
 import random
-from shared.data_providers.coingecko_provider import CoinGeckoMarketDataProvider
-from shared.data_providers.binance_provider import BinanceOhlcDataProvider
-from shared.repositories.crypto_data_repository import CryptoDataRepository
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Dict, List, Optional
+from uuid import UUID
+
+# Third-party imports
+from sqlalchemy.orm import Session
+
+# Local application imports
 from shared.analytics.portfolio import (
     PortfolioHolding,
-    calculate_portfolio_value,
-    calculate_pnl,
     calculate_allocation,
     calculate_diversification_score,
-    calculate_portfolio_volatility,
+    calculate_pnl,
     calculate_portfolio_risk_score,
+    calculate_portfolio_value,
+    calculate_portfolio_volatility,
 )
+from shared.data_providers.binance_provider import BinanceOhlcDataProvider
+from shared.data_providers.coingecko_provider import CoinGeckoMarketDataProvider
+from shared.repositories.crypto_data_repository import CryptoDataRepository
 from .database_service import PortfolioDatabaseService
 from .calculations import PortfolioCalculations
+from .advanced_analytics import AdvancedAnalyticsService
+from .tax_service import TaxService
+from .rebalancing_service import RebalancingService
+from .historical_service import HistoricalService
+from .dca_service import DCAService
+from .export_service import ExportService
 from .models import (
     PortfolioResponse,
     PortfolioItemResponse,
@@ -45,6 +56,16 @@ class PortfolioService:
         
         self.db_service = PortfolioDatabaseService()
         self.calculations = PortfolioCalculations()
+        self.advanced_analytics = AdvancedAnalyticsService()
+        self.tax_service = TaxService()
+        self.rebalancing_service = RebalancingService()
+        self.historical_service = HistoricalService()
+        self.dca_service = DCAService()
+        self.export_service = ExportService()
+        
+        # Add coin-specific methods
+        from .coin_methods import add_coin_methods_to_service
+        add_coin_methods_to_service(self)
     
     async def get_portfolio(
         self, db: Session, user_id: UUID
@@ -359,4 +380,292 @@ class PortfolioService:
             import logging
             logging.error(f"Error fetching transaction history: {e}")
             return []
+    
+    # ============================================================
+    # PREMIUM FEATURES METHODS (from premium_methods.py)
+    # ============================================================
+    
+    async def get_wallets(self, db: Session, user_id: UUID):
+        """Get all wallets for a user."""
+        wallets = self.db_service.get_user_wallets(db, user_id)
+        return [
+            {
+                'id': str(w.id),
+                'user_id': str(w.user_id),
+                'name': w.name,
+                'description': w.description,
+                'color': w.color,
+                'is_default': w.is_default,
+                'created_at': w.created_at.isoformat(),
+                'updated_at': w.updated_at.isoformat()
+            }
+            for w in wallets
+        ]
+    
+    async def create_wallet(
+        self,
+        db: Session,
+        user_id: UUID,
+        name: str,
+        description: Optional[str] = None,
+        color: Optional[str] = None,
+        is_default: bool = False
+    ):
+        """Create a new wallet."""
+        wallet = self.db_service.create_wallet(
+            db, user_id, name, description, color, is_default
+        )
+        return {
+            'id': str(wallet.id),
+            'user_id': str(wallet.user_id),
+            'name': wallet.name,
+            'description': wallet.description,
+            'color': wallet.color,
+            'is_default': wallet.is_default,
+            'created_at': wallet.created_at.isoformat(),
+            'updated_at': wallet.updated_at.isoformat()
+        }
+    
+    async def get_sharpe_ratio(
+        self,
+        db: Session,
+        user_id: UUID,
+        wallet_id: Optional[UUID] = None,
+        timeframe: str = '30D'
+    ):
+        """Calculate Sharpe Ratio."""
+        snapshots = self.db_service.get_snapshots(db, user_id, wallet_id)
+        if len(snapshots) < 2:
+            return {
+                'sharpe_ratio': Decimal('0'),
+                'portfolio_return': Decimal('0'),
+                'risk_free_rate': self.advanced_analytics.RISK_FREE_RATE,
+                'portfolio_volatility': Decimal('0'),
+                'timeframe': timeframe
+            }
+        
+        returns = self.historical_service.calculate_portfolio_returns(snapshots)
+        sharpe, portfolio_return, risk_free, volatility = self.advanced_analytics.calculate_sharpe_ratio(returns)
+        
+        return {
+            'sharpe_ratio': sharpe,
+            'portfolio_return': portfolio_return,
+            'risk_free_rate': risk_free,
+            'portfolio_volatility': volatility,
+            'timeframe': timeframe
+        }
+    
+    async def get_alpha_beta(
+        self,
+        db: Session,
+        user_id: UUID,
+        wallet_id: Optional[UUID] = None,
+        benchmark: str = 'BTC',
+        timeframe: str = '30D'
+    ):
+        """Calculate Alpha and Beta."""
+        snapshots = self.db_service.get_snapshots(db, user_id, wallet_id)
+        portfolio_returns = self.historical_service.calculate_portfolio_returns(snapshots)
+        benchmark_returns = portfolio_returns  # Placeholder - fetch from market data in production
+        
+        alpha, beta = self.advanced_analytics.calculate_alpha_beta(
+            portfolio_returns, benchmark_returns
+        )
+        
+        return {
+            'alpha': alpha,
+            'beta': beta,
+            'benchmark': benchmark,
+            'timeframe': timeframe
+        }
+    
+    async def get_realized_unrealized(
+        self,
+        db: Session,
+        user_id: UUID,
+        wallet_id: Optional[UUID] = None
+    ):
+        """Get realized and unrealized gains/losses."""
+        transactions = self.db_service.get_user_transactions(db, user_id, wallet_id)
+        items = self.db_service.get_user_portfolio(db, user_id)
+        
+        tx_dicts = [
+            {
+                'transaction_type': tx.transaction_type,
+                'coin_symbol': tx.coin_symbol,
+                'amount': tx.amount,
+                'price': tx.price,
+                'profit_loss': Decimal('0')
+            }
+            for tx in transactions
+        ]
+        
+        coin_symbols = [item.coin_symbol.upper() for item in items]
+        price_data_map = await self.repository.get_portfolio_data(coin_symbols)
+        current_prices = {
+            symbol: price_data.price
+            for symbol, price_data in price_data_map.items()
+        }
+        
+        holdings_dicts = [
+            {
+                'coin_symbol': item.coin_symbol,
+                'amount': item.amount,
+                'buy_price': item.buy_price
+            }
+            for item in items
+        ]
+        
+        result = self.tax_service.calculate_realized_unrealized(
+            tx_dicts, holdings_dicts, current_prices
+        )
+        return result
+    
+    async def get_rebalancing_suggestions(
+        self,
+        db: Session,
+        user_id: UUID,
+        wallet_id: Optional[UUID] = None
+    ):
+        """Get rebalancing suggestions."""
+        portfolio = await self.get_portfolio(db, user_id)
+        targets = self.db_service.get_rebalancing_targets(db, user_id, wallet_id)
+        target_allocations = {t.coin_symbol: t.target_percentage for t in targets}
+        
+        if not target_allocations:
+            return {
+                'suggestions': [],
+                'total_deviation': Decimal('0'),
+                'needs_rebalancing': False
+            }
+        
+        holdings = [
+            PortfolioHolding(
+                symbol=item.coin_symbol.upper(),
+                amount=item.amount,
+                buy_price=item.buy_price,
+                current_price=Decimal(str(item.current_price))
+            )
+            for item in portfolio.items
+        ]
+        
+        tolerance = targets[0].tolerance if targets else Decimal('5.0')
+        suggestions = self.rebalancing_service.calculate_rebalancing_suggestions(
+            holdings, portfolio.total_value, target_allocations, tolerance
+        )
+        
+        current_allocation = self.rebalancing_service.calculate_current_allocation(
+            holdings, portfolio.total_value
+        )
+        total_deviation = self.rebalancing_service.calculate_total_deviation(
+            current_allocation, target_allocations
+        )
+        needs_rebalancing = self.rebalancing_service.needs_rebalancing(
+            current_allocation, target_allocations, tolerance
+        )
+        
+        return {
+            'suggestions': suggestions,
+            'total_deviation': total_deviation,
+            'needs_rebalancing': needs_rebalancing
+        }
+    
+    async def export_portfolio(
+        self,
+        db: Session,
+        user_id: UUID,
+        wallet_id: Optional[UUID] = None,
+        format: str = 'pdf',
+        period: str = 'ALL'
+    ):
+        """Export portfolio data."""
+        portfolio = await self.get_portfolio(db, user_id)
+        
+        # Get transactions if available
+        transactions = self.db_service.get_user_transactions(db, user_id, wallet_id, limit=1000)
+        
+        portfolio_data = {
+            'total_value': portfolio.total_value,
+            'total_cost': sum([item.amount * item.buy_price for item in portfolio.items]),
+            'total_profit_loss': portfolio.total_profit_loss,
+            'total_profit_loss_percent': portfolio.total_profit_loss_percent,
+            'items': [
+                {
+                    'coin_symbol': item.coin_symbol,
+                    'amount': float(item.amount),
+                    'buy_price': float(item.buy_price),
+                    'current_price': float(item.current_price),
+                    'total_value': float(item.total_value),
+                    'profit_loss': float(item.profit_loss),
+                    'profit_loss_percent': float(item.profit_loss_percent)
+                }
+                for item in portfolio.items
+            ],
+            'transactions': [
+                {
+                    'transaction_date': tx.transaction_date.isoformat(),
+                    'transaction_type': tx.transaction_type,
+                    'coin_symbol': tx.coin_symbol,
+                    'amount': float(tx.amount),
+                    'price': float(tx.price),
+                    'fee': float(tx.fee),
+                    'total_cost': float(tx.total_cost),
+                }
+                for tx in transactions
+            ]
+        }
+        
+        if format == 'pdf':
+            return self.export_service.generate_pdf_report(portfolio_data, period)
+        elif format == 'csv':
+            return self.export_service.generate_csv_export(portfolio_data, 'full')
+        elif format == 'excel':
+            return self.export_service.generate_excel_export(portfolio_data)
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+    
+    # ============================================================
+    # PREMIUM FEATURES: WALLET METHODS
+    # ============================================================
+    
+    async def get_wallets(self, db: Session, user_id: UUID):
+        """Get all wallets for a user."""
+        wallets = self.db_service.get_user_wallets(db, user_id)
+        return [
+            {
+                'id': str(w.id),
+                'user_id': str(w.user_id),
+                'name': w.name,
+                'description': w.description,
+                'color': w.color,
+                'is_default': w.is_default,
+                'created_at': w.created_at.isoformat(),
+                'updated_at': w.updated_at.isoformat()
+            }
+            for w in wallets
+        ]
+    
+    async def create_wallet(
+        self,
+        db: Session,
+        user_id: UUID,
+        name: str,
+        description: Optional[str] = None,
+        color: Optional[str] = None,
+        is_default: bool = False
+    ):
+        """Create a new wallet."""
+        wallet = self.db_service.create_wallet(
+            db, user_id, name, description, color, is_default
+        )
+        return {
+            'id': str(wallet.id),
+            'user_id': str(wallet.user_id),
+            'name': wallet.name,
+            'description': wallet.description,
+            'color': wallet.color,
+            'is_default': wallet.is_default,
+            'created_at': wallet.created_at.isoformat(),
+            'updated_at': wallet.updated_at.isoformat()
+        }
 

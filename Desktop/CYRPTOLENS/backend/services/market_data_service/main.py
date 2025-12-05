@@ -7,13 +7,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from shared.config import settings
 from shared.database import get_db
+from shared.sentry_init import init_sentry
+
+# Initialize Sentry
+init_sentry()
 from .service import MarketDataService
 from .models import (
     MarketOverviewResponse,
     HeatmapResponse,
     DominanceResponse,
     FearGreedResponse,
-    VolatilityResponse
+    VolatilityResponse,
+    ExchangesResponse,
+    ChainsResponse,
+    CategoriesResponse,
+    MarketCapHistoryResponse
 )
 
 app = FastAPI(
@@ -32,8 +40,9 @@ app.add_middleware(
 )
 
 
-# Initialize service
-market_service = MarketDataService()
+# Initialize service using factory (for DI support)
+from shared.service_factory import get_market_data_service
+market_service = get_market_data_service()
 
 
 @app.on_event("shutdown")
@@ -131,3 +140,72 @@ async def get_market_trend(
     Each value represents the market cap change percentage for that day.
     """
     return await market_service.get_market_trend(db, days=days)
+
+
+@app.get("/market/exchanges", response_model=ExchangesResponse)
+async def get_exchanges(
+    exchange_type: str = Query(default="all", description="Filter by type: all, Spot, Derivatives, DEX"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get exchanges list.
+    
+    Returns list of exchanges with:
+    - Name, score, 24h volume
+    - Exchange type (Spot, Derivatives, DEX)
+    """
+    return await market_service.get_exchanges(db, exchange_type=exchange_type)
+
+
+@app.get("/market/chains", response_model=ChainsResponse)
+async def get_chains(db: Session = Depends(get_db)):
+    """
+    Get blockchain chains list.
+    
+    Returns list of chains with:
+    - Name, symbol, projects count
+    - TVL and 24h TVL change
+    """
+    return await market_service.get_chains(db)
+
+
+@app.get("/market/categories", response_model=CategoriesResponse)
+async def get_categories(db: Session = Depends(get_db)):
+    """
+    Get cryptocurrency categories list.
+    
+    Returns list of categories with:
+    - Name, market cap
+    - Average price change
+    """
+    return await market_service.get_categories(db)
+
+
+@app.get("/market/market-cap-history", response_model=MarketCapHistoryResponse)
+async def get_market_cap_history(
+    days: int = Query(default=30, ge=1, le=365, description="Number of days for history"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get market cap history.
+    
+    Returns historical market cap data points:
+    - Timestamp (Unix)
+    - Market cap in USD
+    """
+    return await market_service.get_market_cap_history(db, days=days)
+
+
+@app.get("/market/calendar")
+async def get_market_calendar(
+    db: Session = Depends(get_db)
+):
+    """
+    Get market calendar events (upcoming airdrops, listings, etc.).
+    
+    Returns list of calendar events with:
+    - Title, description, date
+    - Event type (airdrop, listing, upgrade, etc.)
+    - Related coin symbol
+    """
+    return await market_service.get_market_calendar(db)
